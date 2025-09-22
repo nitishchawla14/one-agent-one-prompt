@@ -13,7 +13,7 @@ from langchain_core.tools import tool
 # Hardcoded ADO Configuration
 ADO_ORGANIZATION = "agentic-framework-hackathon"
 ADO_PROJECT = "Agentic Framework"
-PAT_TOKEN = "FXKooDFvUbNCf85l88kav0X2Wqci2FlBnSU3cKeteipcRIUD4ZFyJQQJ99BIACAAAAAJ0deGAAASAZDO2eBD"
+PAT_TOKEN = ""
 
 def _get_auth_header():
     """Get authentication header for ADO API calls"""
@@ -272,4 +272,5 @@ def create_ado_task(
             return f"❌ Failed to create Task: {response.status_code} - {response.text}"
             
     except Exception as e:
+
         return f"❌ Error creating Task: {str(e)}"
