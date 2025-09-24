@@ -274,3 +274,199 @@ def create_ado_task(
     except Exception as e:
 
         return f"❌ Error creating Task: {str(e)}"
+
+@tool
+def query_work_items_by_feature(
+    feature_name: Annotated[str, "The name of the feature to search for"]
+) -> str:
+    """
+    Query all work items (user stories and tasks) associated with a specific feature.
+    
+    Args:
+        feature_name: The name of the feature to search for
+        
+    Returns:
+        List of work items with their IDs, titles, and current states
+    """
+    try:
+        auth_header = _get_auth_header()
+        
+        # WIQL query to find all work items under a feature
+        wiql_query = f"""
+        SELECT [System.Id], [System.WorkItemType], [System.Title], [System.State], [System.AssignedTo]
+        FROM WorkItemLinks
+        WHERE ([Source].[System.TeamProject] = @project 
+               AND [Source].[System.WorkItemType] = 'Feature' 
+               AND [Source].[System.Title] CONTAINS '{feature_name}')
+        AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward')
+        AND ([Target].[System.TeamProject] = @project)
+        ORDER BY [System.Id]
+        """
+        
+        # Execute WIQL query
+        wiql_url = f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/wit/wiql?api-version=7.1-preview.2"
+        wiql_data = {"query": wiql_query}
+        
+        headers = {**auth_header, "Content-Type": "application/json"}
+        response = requests.post(wiql_url, json=wiql_data, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            return f"❌ Failed to query work items: {response.status_code} - {response.text}"
+            
+        wiql_result = response.json()
+        work_item_relations = wiql_result.get('workItemRelations', [])
+        
+        if not work_item_relations:
+            return f"❌ No work items found for feature: {feature_name}"
+        
+        # Get work item IDs (exclude the feature itself)
+        work_item_ids = []
+        for relation in work_item_relations:
+            if relation.get('target'):
+                work_item_ids.append(str(relation['target']['id']))
+        
+        if not work_item_ids:
+            return f"❌ No child work items found for feature: {feature_name}"
+        
+        # Get detailed work item information
+        work_items_url = f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/wit/workitems?ids={','.join(work_item_ids)}&api-version=7.1-preview.3"
+        
+        response = requests.get(work_items_url, headers=auth_header, timeout=30)
+        
+        if response.status_code != 200:
+            return f"❌ Failed to get work item details: {response.status_code} - {response.text}"
+            
+        work_items = response.json().get('value', [])
+        
+        result = f"✅ Found {len(work_items)} work items for feature '{feature_name}':\n\n"
+        
+        for item in work_items:
+            item_id = item.get('id')
+            fields = item.get('fields', {})
+            work_item_type = fields.get('System.WorkItemType', 'Unknown')
+            title = fields.get('System.Title', 'No Title')
+            state = fields.get('System.State', 'Unknown')
+            assigned_to = fields.get('System.AssignedTo', {}).get('displayName', 'Unassigned')
+            
+            result += f"• {work_item_type} #{item_id}: {title}\n"
+            result += f"  State: {state} | Assigned: {assigned_to}\n\n"
+        
+        return result
+        
+    except Exception as e:
+        return f"❌ Error querying work items: {str(e)}"
+
+@tool
+def update_work_item_state(
+    work_item_id: Annotated[int, "The ID of the work item to update"],
+    new_state: Annotated[str, "The new state (e.g., 'Active', 'Resolved', 'Closed', 'Done')"]
+) -> str:
+    """
+    Update the state of a specific work item (user story or task).
+    
+    Args:
+        work_item_id: The ID of the work item to update
+        new_state: The new state to set (common states: Active, Resolved, Closed, Done)
+        
+    Returns:
+        Success or error message
+    """
+    try:
+        auth_header = _get_auth_header()
+        
+        # Update work item state
+        api_url = f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/wit/workItems/{work_item_id}?api-version=7.1-preview.3"
+        
+        update_data = [
+            {"op": "add", "path": "/fields/System.State", "value": new_state}
+        ]
+        
+        headers = {**auth_header, "Content-Type": "application/json-patch+json"}
+        response = requests.patch(api_url, json=update_data, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            work_item = response.json()
+            title = work_item.get('fields', {}).get('System.Title', 'Unknown')
+            work_item_type = work_item.get('fields', {}).get('System.WorkItemType', 'Unknown')
+            work_item_url = f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_workitems/edit/{work_item_id}"
+            
+            return f"✅ {work_item_type} updated successfully!\nID: {work_item_id}\nTitle: {title}\nNew State: {new_state}\nURL: {work_item_url}"
+        else:
+            return f"❌ Failed to update work item: {response.status_code} - {response.text}"
+            
+    except Exception as e:
+        return f"❌ Error updating work item: {str(e)}"
+
+@tool
+def bulk_update_work_items_state(
+    feature_name: Annotated[str, "The name of the feature whose work items to update"],
+    new_state: Annotated[str, "The new state to set for all work items"],
+    work_item_type_filter: Annotated[Optional[str], "Optional filter by work item type ('User Story', 'Task', or leave empty for all)"] = None
+) -> str:
+    """
+    Update the state of all work items associated with a specific feature.
+    
+    Args:
+        feature_name: The name of the feature whose work items to update
+        new_state: The new state to set (e.g., 'Active', 'Resolved', 'Closed', 'Done')
+        work_item_type_filter: Optional filter to update only specific work item types
+        
+    Returns:
+        Summary of updates performed
+    """
+    try:
+        # First, query the work items
+        query_result = query_work_items_by_feature(feature_name)
+        
+        if "❌" in query_result:
+            return query_result  # Return the error from the query
+            
+        # Extract work item IDs from the query result using simple parsing
+        work_items_to_update = []
+        lines = query_result.split('\n')
+        
+        for line in lines:
+            if line.strip().startswith('•'):
+                # Parse line like "• Task #123: Task Title"
+                try:
+                    parts = line.split('#')
+                    if len(parts) > 1:
+                        id_part = parts[1].split(':')[0].strip()
+                        work_item_id = int(id_part)
+                        
+                        work_item_type = line.split('#')[0].replace('•', '').strip()
+                        
+                        # Apply filter if specified
+                        if work_item_type_filter is None or work_item_type_filter.lower() in work_item_type.lower():
+                            work_items_to_update.append((work_item_id, work_item_type))
+                except:
+                    continue  # Skip lines that can't be parsed
+        
+        if not work_items_to_update:
+            return f"❌ No work items found to update for feature '{feature_name}'"
+        
+        # Update each work item
+        results = []
+        success_count = 0
+        error_count = 0
+        
+        for work_item_id, work_item_type in work_items_to_update:
+            update_result = update_work_item_state(work_item_id, new_state)
+            
+            if "✅" in update_result:
+                success_count += 1
+                results.append(f"✅ {work_item_type} #{work_item_id} updated to {new_state}")
+            else:
+                error_count += 1
+                results.append(f"❌ {work_item_type} #{work_item_id} failed to update")
+        
+        summary = f"✅ Bulk update completed for feature '{feature_name}':\n"
+        summary += f"• Successfully updated: {success_count} work items\n"
+        summary += f"• Failed updates: {error_count} work items\n"
+        summary += f"• New state: {new_state}\n\n"
+        summary += "Details:\n" + "\n".join(results)
+        
+        return summary
+        
+    except Exception as e:
+        return f"❌ Error performing bulk update: {str(e)}"
